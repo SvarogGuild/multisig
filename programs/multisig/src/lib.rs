@@ -17,36 +17,77 @@
 //! the `execute_transaction`, once enough (i.e. `threhsold`) of the owners have
 //! signed.
 
+use crate::ErrorCode::InvalidOwner;
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program;
 use anchor_lang::solana_program::instruction::Instruction;
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::system_instruction;
+use std::collections::hash_map::DefaultHasher;
 use std::convert::Into;
+use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 
 declare_id!("FeqQXwTJvmt6YbLTzibZJVvDFq3tKp49zjWkPqDk7oZJ");
 
 #[program]
 pub mod multisig {
+
     use super::*;
 
     // Initializes a new multisig account with a set of owners and a threshold.
-    pub fn create_multisig(ctx: Context<CreateMultisig>, args: CreateMultisigArgs) -> Result<()> {
+    pub fn create_multisig<'info>(
+        ctx: Context<'_, '_, '_, 'info, CreateMultisig<'info>>,
+        args: CreateMultisigArgs,
+    ) -> Result<()> {
         assert_unique_owners(&args.owners)?;
         require!(
             args.threshold > 0 && args.threshold <= args.owners.len() as u64,
             InvalidThreshold
         );
         require!(!args.owners.is_empty(), InvalidOwnersLen);
+        let min_balance = ctx
+            .accounts
+            .rent
+            .minimum_balance(MultisigOwner::space_required() as usize);
+        for (index, owner_pubkey) in args.owners.iter().enumerate() {
+            let multisig_owner = ctx.remaining_accounts.get(index).unwrap();
+            let bump: &u8 = args.bumps.get(index).unwrap();
+            let multisig_pubkey = ctx.accounts.multisig.key();
+            let multisig_signer = ctx.accounts.owner.as_ref();
+            invoke_signed(
+                &system_instruction::create_account(
+                    multisig_signer.key,
+                    multisig_owner.key,
+                    min_balance,
+                    MultisigOwner::space_required(),
+                    ctx.program_id,
+                ),
+                &[multisig_signer.clone(), multisig_owner.clone()],
+                &[&[
+                    "ownership".as_ref(),
+                    &multisig_pubkey.to_bytes(),
+                    &owner_pubkey.to_bytes(),
+                    &[*bump],
+                ]],
+            )?;
+
+            let multisig_owner_data = MultisigOwner {
+                multisig: multisig_pubkey,
+                owner: *owner_pubkey,
+            };
+            multisig_owner_data
+                .try_serialize(&mut &mut multisig_owner.data.borrow_mut()[..])
+                .unwrap();
+        }
 
         let multisig = ctx.accounts.multisig.deref_mut();
         *multisig = Multisig {
-            owners: args.owners,
             name: args.name,
             threshold: args.threshold,
             nonce: args.nonce,
             owner_set_seqno: 0,
+            owners_amount: args.owners.len() as u64,
         };
-
         Ok(())
     }
 
@@ -56,18 +97,17 @@ pub mod multisig {
         ctx: Context<CreateTransaction>,
         args: CreateTransactionArgs,
     ) -> Result<()> {
-        let owner_index = ctx
+        if !ctx
             .accounts
-            .multisig
-            .owners
-            .iter()
-            .position(|a| a == ctx.accounts.proposer.key)
-            .ok_or(ErrorCode::InvalidOwner)?;
+            .proposer
+            .key
+            .eq(&ctx.accounts.multisig_owner.owner)
+        {
+            return Err(InvalidOwner.into());
+        }
 
-        let mut signers = Vec::new();
-        signers.resize(ctx.accounts.multisig.owners.len(), false);
-        signers[owner_index] = true;
-
+        let owner_hash = hash_pubkey(ctx.accounts.multisig_owner.owner);
+        let signers = vec![owner_hash];
         let tx = ctx.accounts.transaction.deref_mut();
         *tx = Transaction {
             multisig: ctx.accounts.multisig.key(),
@@ -75,9 +115,9 @@ pub mod multisig {
             name: args.name,
             accounts: args.accs,
             data: args.data,
-            signers,
             did_execute: false,
             owner_set_seqno: ctx.accounts.multisig.owner_set_seqno,
+            signers,
         };
 
         Ok(())
@@ -85,40 +125,36 @@ pub mod multisig {
 
     // Approves a transaction on behalf of an owner of the multisig.
     pub fn approve(ctx: Context<Approve>) -> Result<()> {
-        let owner_index = ctx
+        if !ctx
             .accounts
+            .multisig_owner
             .multisig
-            .owners
+            .eq(&ctx.accounts.transaction.multisig)
+        {
+            Err(InvalidOwner)?
+        }
+        let owner_hash = hash_pubkey(ctx.accounts.multisig_owner.owner);
+        if ctx
+            .accounts
+            .transaction
+            .signers
             .iter()
-            .position(|a| a == ctx.accounts.owner.key)
-            .ok_or(ErrorCode::InvalidOwner)?;
-
-        ctx.accounts.transaction.signers[owner_index] = true;
-
+            .any(|signer| owner_hash.eq(signer))
+        {
+            return Err(ErrorCode::AlreadySigned.into());
+        }
+        ctx.accounts.transaction.signers.push(owner_hash);
         Ok(())
     }
 
-    // Set owners and threshold at once.
-    pub fn set_owners_and_change_threshold<'info>(
+    // Sets the owners field on the multisig. The only way this can be invoked
+    // is via a recursive call from execute_transaction -> update_owners_and_threshold.
+    pub fn update_owners_and_threshold<'info>(
         ctx: Context<'_, '_, '_, 'info, Auth<'info>>,
         owners: Vec<Pubkey>,
+        bumps: Vec<u8>,
         threshold: u64,
     ) -> Result<()> {
-        set_owners(
-            Context::new(
-                ctx.program_id,
-                ctx.accounts,
-                ctx.remaining_accounts,
-                ctx.bumps.clone(),
-            ),
-            owners,
-        )?;
-        change_threshold(ctx, threshold)
-    }
-
-    // Sets the owners field on the multisig. The only way this can be invoked
-    // is via a recursive call from execute_transaction -> set_owners.
-    pub fn set_owners(ctx: Context<Auth>, owners: Vec<Pubkey>) -> Result<()> {
         assert_unique_owners(&owners)?;
         require!(!owners.is_empty(), InvalidOwnersLen);
 
@@ -128,22 +164,61 @@ pub mod multisig {
             multisig.threshold = owners.len() as u64;
         }
 
-        multisig.owners = owners;
+        let min_balance = ctx
+            .accounts
+            .rent
+            .minimum_balance(MultisigOwner::space_required() as usize);
+        let multisig_signer = ctx.accounts.multisig_signer.as_ref();
+        let multisig_pubkey = &multisig.key();
+        for (index, multisig_owner) in ctx.remaining_accounts.iter().enumerate() {
+            if multisig_owner.owner != ctx.program_id {
+                let owner_pubkey = owners.get(index).unwrap();
+                let bump = bumps.get(index).unwrap();
+                invoke_signed(
+                    &system_instruction::create_account(
+                        multisig_signer.key,
+                        multisig_owner.key,
+                        min_balance,
+                        MultisigOwner::space_required(),
+                        ctx.program_id,
+                    ),
+                    &[multisig_signer.clone(), multisig_owner.clone()],
+                    &[&[
+                        "ownership".as_ref(),
+                        &multisig_pubkey.to_bytes(),
+                        &owner_pubkey.to_bytes(),
+                        &[*bump],
+                    ]],
+                )?;
+                let multisig_owner_data = MultisigOwner {
+                    multisig: *multisig_pubkey,
+                    owner: *owner_pubkey,
+                };
+                multisig_owner_data
+                    .try_serialize(&mut &mut multisig_owner.data.borrow_mut()[..])
+                    .unwrap();
+                multisig.owners_amount += 1;
+            } else {
+                let dest_starting_lamports = multisig_signer.lamports();
+                **multisig_signer.lamports.borrow_mut() = dest_starting_lamports
+                    .checked_add(multisig_owner.lamports())
+                    .unwrap();
+                **multisig_owner.lamports.borrow_mut() = 0;
+
+                let mut source_data = multisig_owner.data.borrow_mut();
+                source_data.fill(0);
+                multisig.owners_amount -= 1;
+            }
+        }
         multisig.owner_set_seqno += 1;
 
-        Ok(())
-    }
-
-    // Changes the execution threshold of the multisig. The only way this can be
-    // invoked is via a recursive call from execute_transaction ->
-    // change_threshold.
-    pub fn change_threshold(ctx: Context<Auth>, threshold: u64) -> Result<()> {
+        // Change threshold
         require!(threshold > 0, InvalidThreshold);
-        if threshold > ctx.accounts.multisig.owners.len() as u64 {
+        if threshold > multisig.owners_amount {
             return Err(ErrorCode::InvalidThreshold.into());
         }
-        let multisig = &mut ctx.accounts.multisig;
         multisig.threshold = threshold;
+
         Ok(())
     }
 
@@ -155,13 +230,7 @@ pub mod multisig {
         }
 
         // Do we have enough signers.
-        let sig_count = ctx
-            .accounts
-            .transaction
-            .signers
-            .iter()
-            .filter(|&did_sign| *did_sign)
-            .count() as u64;
+        let sig_count = ctx.accounts.transaction.signers.len() as u64;
         if sig_count < ctx.accounts.multisig.threshold {
             return Err(ErrorCode::NotEnoughSigners.into());
         }
@@ -183,7 +252,8 @@ pub mod multisig {
         let seeds = &[multisig_key.as_ref(), &[ctx.accounts.multisig.nonce]];
         let signer = &[&seeds[..]];
         let accounts = ctx.remaining_accounts;
-        solana_program::program::invoke_signed(&ix, accounts, signer)?;
+
+        invoke_signed(&ix, accounts, signer)?;
 
         // Burn the transaction to ensure one time use.
         ctx.accounts.transaction.did_execute = true;
@@ -198,6 +268,7 @@ pub struct CreateMultisigArgs {
     threshold: u64,
     nonce: u8,
     name: String,
+    bumps: Vec<u8>,
 }
 
 #[derive(Accounts)]
@@ -212,8 +283,8 @@ pub struct CreateMultisig<'info> {
         space = Multisig::space_required(&args.owners, &args.name)
     )]
     multisig: Account<'info, Multisig>,
-
     system_program: Program<'info, System>,
+    rent: Sysvar<'info, Rent>,
 }
 
 #[derive(AnchorDeserialize, AnchorSerialize)]
@@ -234,10 +305,11 @@ pub struct CreateTransaction<'info> {
         space = Transaction::space_required(&args.accs, &args.data, &args.name)
     )]
     transaction: Account<'info, Transaction>,
+
     // One of the owners. Checked in the handler.
     #[account(mut)]
     proposer: Signer<'info>,
-
+    multisig_owner: Account<'info, MultisigOwner>,
     system_program: Program<'info, System>,
 }
 
@@ -247,6 +319,8 @@ pub struct Approve<'info> {
     multisig: Box<Account<'info, Multisig>>,
     #[account(mut, has_one = multisig)]
     transaction: Box<Account<'info, Transaction>>,
+    multisig_owner: Account<'info, MultisigOwner>,
+
     // One of the multisig owners. Checked in the handler.
     owner: Signer<'info>,
 }
@@ -255,17 +329,20 @@ pub struct Approve<'info> {
 pub struct Auth<'info> {
     #[account(mut)]
     multisig: Box<Account<'info, Multisig>>,
-    #[account(
+    #[account(mut,
         seeds = [multisig.key().as_ref()],
         bump = multisig.nonce,
     )]
     multisig_signer: Signer<'info>,
+    system_program: Program<'info, System>,
+    rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
 pub struct ExecuteTransaction<'info> {
     #[account(constraint = multisig.owner_set_seqno == transaction.owner_set_seqno)]
     multisig: Box<Account<'info, Multisig>>,
+
     /// CHECK:
     #[account(
         seeds = [multisig.key().as_ref()],
@@ -278,11 +355,11 @@ pub struct ExecuteTransaction<'info> {
 
 #[account]
 pub struct Multisig {
-    pub owners: Vec<Pubkey>,
     pub name: String,
     pub threshold: u64,
     pub nonce: u8,
     pub owner_set_seqno: u32,
+    pub owners_amount: u64,
 }
 
 impl Multisig {
@@ -303,12 +380,12 @@ pub struct Transaction {
     pub accounts: Vec<TransactionAccount>,
     // Instruction data for the transaction.
     pub data: Vec<u8>,
-    // signers[index] is true iff multisig.owners[index] signed the transaction.
-    pub signers: Vec<bool>,
     // Boolean ensuring one time execution.
     pub did_execute: bool,
     // Owner set sequence number.
     pub owner_set_seqno: u32,
+    // Signers pubkey hashes
+    pub signers: Vec<u64>,
 }
 
 impl Transaction {
@@ -327,6 +404,18 @@ impl From<&Transaction> for Instruction {
             accounts: tx.accounts.iter().map(Into::into).collect(),
             data: tx.data.clone(),
         }
+    }
+}
+
+#[account]
+pub struct MultisigOwner {
+    pub multisig: Pubkey,
+    pub owner: Pubkey,
+}
+
+impl MultisigOwner {
+    pub fn space_required() -> u64 {
+        72
     }
 }
 
@@ -366,6 +455,12 @@ fn assert_unique_owners(owners: &[Pubkey]) -> Result<()> {
     Ok(())
 }
 
+pub fn hash_pubkey(pubkey: Pubkey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    pubkey.to_bytes().hash(&mut hasher);
+    hasher.finish()
+}
+
 #[error]
 pub enum ErrorCode {
     #[msg("The given owner is not part of this multisig.")]
@@ -386,4 +481,6 @@ pub enum ErrorCode {
     InvalidThreshold,
     #[msg("Owners must be unique")]
     UniqueOwners,
+    #[msg("The owner has already signed the transaction")]
+    AlreadySigned,
 }
